@@ -1,0 +1,607 @@
+import sqlite3
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pandas as pd
+from datetime import datetime
+
+
+# إعداد قاعدة البيانات
+def setup_database():
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        quantity INTEGER
+                    )''')
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS transactions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        item_name TEXT NOT NULL,
+                        used_quantity INTEGER,
+                        receiver TEXT,
+                        transaction_date TEXT
+                    )''')
+    
+    conn.commit()
+    conn.close()
+
+# التحقق من هيكل قاعدة البيانات وإصلاحها إذا لزم الأمر
+def check_and_fix_database():
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("SELECT quantity FROM items LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute("ALTER TABLE items RENAME COLUMN added_quantity TO quantity")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE items DROP COLUMN available_quantity")
+        except sqlite3.OperationalError:
+            pass
+    
+    try:
+        cursor.execute("SELECT transaction_date FROM transactions LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN transaction_date TEXT")
+        except sqlite3.OperationalError:
+            pass
+    
+    conn.commit()
+    conn.close()
+
+# إضافة أو تحديث صنف
+def add_item(name, quantity):
+    if not name:
+        messagebox.showerror("خطأ", "يرجى إدخال اسم الصنف!")
+        return
+    
+    try:
+        quantity = int(quantity or 0)
+        if quantity < 0:
+            messagebox.showerror("خطأ", "عدد الصنف يجب أن يكون رقمًا غير سالب!")
+            return
+    except ValueError:
+        messagebox.showerror("خطأ", "يرجى إدخال رقم صحيح لعدد الصنف!")
+        return
+    
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT quantity FROM items WHERE name = ?", (name,))
+    result = cursor.fetchone()
+    
+    if result:
+        messagebox.showinfo("تنبيه", f"الصنف '{name}' موجود بالفعل، سيتم تحديث عدد الصنف.")
+        current_quantity = result[0]
+        new_quantity = current_quantity + quantity
+        cursor.execute("UPDATE items SET quantity = ? WHERE name = ?", (new_quantity, name))
+    else:
+        cursor.execute("INSERT INTO items (name, quantity) VALUES (?, ?)", (name, quantity))
+    
+    conn.commit()
+    conn.close()
+    refresh_inventory()
+    update_item_dropdown()
+    update_statistics()
+    clear_item_entries()
+
+# تعديل صنف
+def edit_item():
+    selected_item = tree_inventory.selection()
+    if not selected_item:
+        messagebox.showerror("خطأ", "يرجى اختيار صنف من الجدول لتعديله!")
+        return
+    
+    item_values = tree_inventory.item(selected_item, "values")
+    item_name = item_values[2]
+    
+    edit_window = tk.Toplevel(root)
+    edit_window.title("تعديل صنف")
+    edit_window.geometry("350x200")
+    edit_window.configure(bg="#F5F5F5")
+    
+    tk.Label(edit_window, text=f"تعديل الصنف: {item_name}", bg="#F5F5F5", font=("Arial", 20, "bold"), fg="#000000").pack(pady=15)
+    
+    tk.Label(edit_window, text="عدد الصنف", bg="#F5F5F5", font=("Arial", 16), fg="#000000").pack()
+    entry_edit_quantity = tk.Entry(edit_window, font=("Arial", 16), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+    entry_edit_quantity.insert(0, item_values[1])
+    entry_edit_quantity.pack(pady=10, fill="x", padx=30)
+    
+    def save_changes():
+        try:
+            new_quantity = int(entry_edit_quantity.get() or 0)
+            if new_quantity < 0:
+                messagebox.showerror("خطأ", "عدد الصنف يجب أن يكون رقمًا غير سالب!")
+                return
+        except ValueError:
+            messagebox.showerror("خطأ", "يرجى إدخال رقم صحيح لعدد الصنف!")
+            return
+        
+        conn = sqlite3.connect("inventory.db")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE items SET quantity = ? WHERE name = ?", (new_quantity, item_name))
+        conn.commit()
+        conn.close()
+        refresh_inventory()
+        update_statistics()
+        edit_window.destroy()
+        messagebox.showinfo("نجاح", "تم تعديل الصنف بنجاح!")
+    
+    tk.Button(edit_window, text="حفظ التغييرات", bg="#D4A017", fg="white", font=("Arial", 16, "bold"), command=save_changes, relief="flat", bd=0).pack(pady=15)
+
+# حذف صنف
+def delete_item():
+    selected_item = tree_inventory.selection()
+    if not selected_item:
+        messagebox.showerror("خطأ", "يرجى اختيار صنف من الجدول لحذفه!")
+        return
+    
+    item_values = tree_inventory.item(selected_item, "values")
+    item_name = item_values[2]
+    
+    if messagebox.askyesno("تأكيد", f"هل أنت متأكد من حذف الصنف '{item_name}' وجميع العمليات المرتبطة به؟"):
+        conn = sqlite3.connect("inventory.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM items WHERE name = ?", (item_name,))
+        cursor.execute("DELETE FROM transactions WHERE item_name = ?", (item_name,))
+        conn.commit()
+        conn.close()
+        refresh_inventory()
+        refresh_transactions()
+        update_item_dropdown()
+        update_statistics()
+        messagebox.showinfo("نجاح", "تم حذف الصنف بنجاح!")
+
+# إضافة عملية استخدام
+def add_transaction(item_name, used_quantity, receiver):
+    if not item_name or not used_quantity or not receiver:
+        messagebox.showerror("خطأ", "يرجى إدخال جميع الحقول!")
+        return
+    
+    try:
+        used_quantity = int(used_quantity)
+        if used_quantity <= 0:
+            messagebox.showerror("خطأ", "الكمية المستخدمة يجب أن تكون أكبر من صفر!")
+            return
+    except ValueError:
+        messagebox.showerror("خطأ", "يرجى إدخال رقم صحيح للكمية المستخدمة!")
+        return
+    
+    used, final_balance = get_item_details(item_name)
+    if final_balance < used_quantity:
+        messagebox.showerror("خطأ", f"الكمية المستخدمة ({used_quantity}) أكبر من الرصيد النهائي ({final_balance})!")
+        return
+    
+    transaction_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO transactions (item_name, used_quantity, receiver, transaction_date) VALUES (?, ?, ?, ?)",
+                   (item_name, used_quantity, receiver, transaction_date))
+    conn.commit()
+    conn.close()
+    refresh_inventory()
+    refresh_transactions()
+    update_statistics()
+    clear_transaction_entries()
+
+# حساب الكمية المستخدمة والرصيد النهائي
+def get_item_details(item_name):
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()  # تصحيح الخطأ: استخدام conn بدلاً من Conn
+    
+    cursor.execute("SELECT quantity FROM items WHERE name = ?", (item_name,))
+    result = cursor.fetchone()
+    if not result:
+        return 0, 0
+    
+    quantity = result[0]
+    
+    cursor.execute("SELECT SUM(used_quantity) FROM transactions WHERE item_name = ?", (item_name,))
+    used = cursor.fetchone()[0] or 0
+    
+    final_balance = quantity - used
+    
+    conn.close()
+    return used, final_balance
+
+# تحديث جدول المخزن
+def refresh_inventory(search_query=""):
+    for row in tree_inventory.get_children():
+        tree_inventory.delete(row)
+    
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    if search_query:
+        cursor.execute("SELECT name FROM items WHERE name LIKE ?", ('%' + search_query + '%',))
+    else:
+        cursor.execute("SELECT name FROM items")
+    items = cursor.fetchall()
+    
+    for i, item in enumerate(items):
+        item_name = item[0]
+        used, final_balance = get_item_details(item_name)
+        cursor.execute("SELECT quantity FROM items WHERE name = ?", (item_name,))
+        quantity = cursor.fetchone()[0]
+        tag = "evenrow" if i % 2 == 0 else "oddrow"
+        tree_inventory.insert("", "end", values=(final_balance, quantity, item_name), tags=(tag,))
+    
+    conn.close()
+
+# تحديث جدول العمليات
+def refresh_transactions(filter_receiver=""):
+    for row in tree_transactions.get_children():
+        tree_transactions.delete(row)
+    
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    if filter_receiver:
+        cursor.execute("SELECT item_name, used_quantity, receiver, transaction_date FROM transactions WHERE receiver LIKE ?",
+                       ('%' + filter_receiver + '%',))
+    else:
+        cursor.execute("SELECT item_name, used_quantity, receiver, transaction_date FROM transactions")
+    transactions = cursor.fetchall()
+    
+    for i, trans in enumerate(transactions):
+        tag = "evenrow" if i % 2 == 0 else "oddrow"
+        tree_transactions.insert("", "end", values=trans, tags=(tag,))
+    
+    conn.close()
+
+# تحديث الإحصائيات
+def update_statistics():
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM items")
+    total_items = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT SUM(quantity) FROM items")
+    total_quantity = cursor.fetchone()[0] or 0
+    
+    cursor.execute("SELECT SUM(used_quantity) FROM transactions")
+    total_used = cursor.fetchone()[0] or 0
+    
+    conn.close()
+    
+    stats_label.config(text=f"إجمالي الأصناف: {total_items} | "
+                           f"إجمالي عدد الأصناف: {total_quantity} | "
+                           f"إجمالي الكمية المستخدمة: {total_used}")
+
+# تصدير بيانات المخزن إلى Excel
+def export_to_excel():
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT name, quantity FROM items")
+    items = cursor.fetchall()
+    
+    merged_data = []
+    for item in items:
+        item_name, quantity = item
+        used, final_balance = get_item_details(item_name)
+        merged_data.append([final_balance, quantity, item_name])
+    
+    df = pd.DataFrame(merged_data, columns=["الرصيد النهائي", "عدد الصنف", "اسم الصنف"])
+    df.to_excel("inventory_report.xlsx", sheet_name="تقرير المخزن", index=False)
+    
+    messagebox.showinfo("نجاح", "تم تصدير التقرير إلى inventory_report.xlsx")
+    conn.close()
+
+# مسح جميع البيانات
+def clear_all_data():
+    if messagebox.askyesno("تأكيد", "هل أنت متأكد من مسح جميع البيانات؟"):
+        conn = sqlite3.connect("inventory.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM items")
+        cursor.execute("DELETE FROM transactions")
+        conn.commit()
+        conn.close()
+        refresh_inventory()
+        refresh_transactions()
+        update_item_dropdown()
+        update_statistics()
+        messagebox.showinfo("نجاح", "تم مسح جميع البيانات!")
+
+# تحديث القائمة المنسدلة لأسماء الأصناف
+def update_item_dropdown():
+    conn = sqlite3.connect("inventory.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM items")
+    items = cursor.fetchall()
+    item_names = [item[0] for item in items]
+    conn.close()
+    
+    trans_item_dropdown['values'] = item_names
+    if item_names:
+        trans_item_dropdown.set(item_names[0])
+    else:
+        trans_item_dropdown.set("")
+
+# تنظيف حقول إدخال الصنف
+def clear_item_entries():
+    entry_item_name.delete(0, tk.END)
+    entry_quantity.delete(0, tk.END)
+
+# تنظيف حقول إدخال العملية
+def clear_transaction_entries():
+    trans_item_dropdown.set("")
+    entry_used.delete(0, tk.END)
+    entry_receiver.delete(0, tk.END)
+
+# البحث عن صنف
+def search_item():
+    search_query = entry_search.get()
+    refresh_inventory(search_query)
+
+# تصفية العمليات بناءً على اسم المستلم
+def filter_transactions():
+    filter_query = entry_filter_receiver.get()
+    refresh_transactions(filter_query)
+
+# تحديث الجداول
+def refresh_all():
+    refresh_inventory()
+    refresh_transactions()
+    update_item_dropdown()
+    update_statistics()
+    messagebox.showinfo("نجاح", "تم تحديث جميع البيانات!")
+
+# تأكيد الإغلاق مع تصدير البيانات
+def on_closing():
+    if messagebox.askyesno("تأكيد الإغلاق", "هل تريد تصدير البيانات إلى Excel قبل الإغلاق؟"):
+        export_to_excel()
+    root.destroy()
+
+# دالة لتحديث عرض الـ Canvas عند تغيير حجم النافذة
+def update_canvas_width(event):
+    canvas.itemconfig(canvas_window, width=event.width)
+
+# واجهة المستخدم
+root = tk.Tk()
+root.title("نظام إدارة المخزن - Areez")
+root.geometry("1200x800")
+root.configure(bg="#F5F5F5")
+root.protocol("WM_DELETE_WINDOW", on_closing)
+
+
+
+
+
+# إضافة العنوان الرئيسي (AREEZ)
+header_frame = tk.Frame(root, bg="#d4a017")
+header_frame.pack(fill="x")
+
+header_label = tk.Label(header_frame, text="AREEZ", font=("Times New Roman", 36, "bold"), fg="#000000", bg="#d4a017")
+header_label.pack(pady=10)
+
+# إعداد أنماط الأزرار مع تأثير hover
+style = ttk.Style()
+style.configure("TButton", font=("Arial", 18, "bold"), background="#D4A017", foreground="black", padding=10, relief="flat")
+style.map("TButton",
+          background=[("active", "#E0B83A")],
+          foreground=[("active", "blue")])
+
+style.configure("Danger.TButton", font=("Arial", 18, "bold"), background="#D32F2F", foreground="black", padding=10, relief="flat")
+style.map("Danger.TButton",
+          background=[("active", "#EF5350")],
+          foreground=[("active", "red")])
+
+# إعداد أنماط الجداول مع تكبير الخط
+style.configure("Treeview", font=("Arial", 24), rowheight=60)
+style.configure("Treeview.Heading", font=("Arial", 20, "bold"))
+style.map("Treeview", background=[("selected", "#D4A017")])
+
+# إنشاء Canvas وScrollbar للتمرير الرأسي للواجهة الرئيسية
+main_frame = tk.Frame(root, bg="#F5F5F5")
+main_frame.pack(fill="both", expand=True)
+
+canvas = tk.Canvas(main_frame, bg="#F5F5F5")
+canvas.pack(side="left", fill="both", expand=True)
+
+scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+scrollbar.pack(side="right", fill="y")
+
+scrollable_frame = tk.Frame(canvas, bg="#F5F5F5")
+
+# إنشاء النافذة داخل الـ Canvas
+canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+# ربط التمرير
+canvas.configure(yscrollcommand=scrollbar.set)
+
+# تحديث منطقة التمرير عند تغيير حجم scrollable_frame
+def configure_scrollable_frame(event):
+    canvas.configure(scrollregion=canvas.bbox("all"))
+
+scrollable_frame.bind("<Configure>", configure_scrollable_frame)
+
+# ربط تحديث العرض عند تغيير حجم النافذة
+canvas.bind("<Configure>", update_canvas_width)
+
+# إطار الإحصائيات
+frame_stats = tk.LabelFrame(scrollable_frame, text="📊 الإحصائيات", bg="#F5F5F5", fg="#000000", font=("Arial", 24, "bold"), relief="flat", bd=2, highlightthickness=1, highlightbackground="#D4A017")
+frame_stats.pack(fill="both", expand=True, padx=10, pady=3)
+
+stats_label = tk.Label(frame_stats, text="إجمالي الأصناف: 0 | إجمالي عدد الأصناف: 0 | إجمالي الكمية المستخدمة: 0",
+                       bg="#F5F5F5", font=("Arial", 24), fg="#000000")
+stats_label.pack(pady=5, fill="x")
+
+# إطار البحث
+frame_search = tk.LabelFrame(scrollable_frame, text="🔍 البحث عن صنف", bg="#F5F5F5", fg="#000000", font=("Arial", 24, "bold"), relief="flat", bd=2, highlightthickness=1, highlightbackground="#D4A017")
+frame_search.pack(fill="both", expand=True, padx=10, pady=3)
+
+tk.Label(frame_search, text="اسم الصنف", bg="#F5F5F5", font=("Arial", 18), fg="#000000").grid(row=0, column=0, padx=15, pady=10, sticky="w")
+entry_search = tk.Entry(frame_search, font=("Arial", 18), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+entry_search.grid(row=0, column=1, padx=15, pady=10, sticky="ew")
+frame_search.grid_columnconfigure(1, weight=1)
+
+search_button = ttk.Button(frame_search, text="بحث 🔎", style="TButton", command=search_item)
+search_button.grid(row=0, column=2, padx=15, pady=10)
+
+# إطار المخزن
+frame_inventory = tk.LabelFrame(scrollable_frame, text="📦 المخزن", bg="#F5F5F5", fg="#000000", font=("Arial", 24, "bold"), relief="flat", bd=2, highlightthickness=1, highlightbackground="#D4A017")
+frame_inventory.pack(fill="both", expand=True, padx=10, pady=3)
+
+inventory_inner_frame = tk.Frame(frame_inventory, bg="#F5F5F5")
+inventory_inner_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+inventory_canvas = tk.Canvas(inventory_inner_frame, bg="#F5F5F5")
+inventory_canvas.pack(side="left", fill="both", expand=True)
+
+inventory_scrollbar_y = ttk.Scrollbar(inventory_inner_frame, orient="vertical", command=inventory_canvas.yview)
+inventory_scrollbar_y.pack(side="right", fill="y")
+
+inventory_scrollbar_x = ttk.Scrollbar(inventory_inner_frame, orient="horizontal", command=inventory_canvas.xview)
+inventory_scrollbar_x.pack(side="bottom", fill="x")
+
+inventory_frame = tk.Frame(inventory_canvas, bg="#F5F5F5")
+inventory_canvas.create_window((0, 0), window=inventory_frame, anchor="nw")
+
+# جدول المخزن
+columns_inventory = ("الرصيد النهائي", "عدد الصنف", "اسم الصنف")
+tree_inventory = ttk.Treeview(inventory_frame, columns=columns_inventory, show="headings")
+for col in columns_inventory:
+    tree_inventory.heading(col, text=col)
+    tree_inventory.column(col, width=490, anchor="center", stretch=True)
+tree_inventory.tag_configure("evenrow", background="#E0E0E0")
+tree_inventory.tag_configure("oddrow", background="#FFFFFF")
+tree_inventory.pack(fill="both", expand=True)
+
+inventory_canvas.configure(yscrollcommand=inventory_scrollbar_y.set, xscrollcommand=inventory_scrollbar_x.set)
+
+def configure_inventory_canvas(event):
+    inventory_canvas.configure(scrollregion=inventory_canvas.bbox("all"))
+
+inventory_frame.bind("<Configure>", configure_inventory_canvas)
+
+# أزرار تعديل وحذف الصنف
+frame_inventory_buttons = tk.Frame(frame_inventory, bg="#F5F5F5")
+frame_inventory_buttons.pack(fill="x", padx=5, pady=5)
+
+edit_button = ttk.Button(frame_inventory_buttons, text="✏️ تعديل الصنف", style="TButton", command=edit_item)
+edit_button.pack(side="left", padx=10)
+
+delete_button = ttk.Button(frame_inventory_buttons, text="🗑️ حذف الصنف", style="Danger.TButton", command=delete_item)
+delete_button.pack(side="left", padx=10)
+
+# إطار العمليات
+frame_transactions = tk.LabelFrame(scrollable_frame, text="📜 سجل العمليات", bg="#F5F5F5", fg="#000000", font=("Arial", 24, "bold"), relief="flat", bd=2, highlightthickness=1, highlightbackground="#D4A017")
+frame_transactions.pack(fill="both", expand=True, padx=10, pady=3)
+
+frame_filter = tk.Frame(frame_transactions, bg="#F5F5F5")
+frame_filter.pack(fill="x", padx=5, pady=5)
+
+tk.Label(frame_filter, text="تصفية حسب اسم المستلم", bg="#F5F5F5", font=("Arial", 22), fg="#000000").pack(side="left", padx=15)
+entry_filter_receiver = tk.Entry(frame_filter, font=("Arial", 22), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+entry_filter_receiver.pack(side="left", padx=15, fill="x", expand=True)
+filter_button = ttk.Button(frame_filter, text="تصفية 🔍", style="TButton", command=filter_transactions)
+filter_button.pack(side="left", padx=15)
+
+transactions_inner_frame = tk.Frame(frame_transactions, bg="#F5F5F5")
+transactions_inner_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+transactions_canvas = tk.Canvas(transactions_inner_frame, bg="#F5F5F5")
+transactions_canvas.pack(side="left", fill="both", expand=True)
+
+transactions_scrollbar_y = ttk.Scrollbar(transactions_inner_frame, orient="vertical", command=transactions_canvas.yview)
+transactions_scrollbar_y.pack(side="right", fill="y")
+
+transactions_scrollbar_x = ttk.Scrollbar(transactions_inner_frame, orient="horizontal", command=transactions_canvas.xview)
+transactions_scrollbar_x.pack(side="bottom", fill="x")
+
+transactions_frame = tk.Frame(transactions_canvas, bg="#F5F5F5")
+transactions_canvas.create_window((0, 0), window=transactions_frame, anchor="nw")
+
+# جدول العمليات
+columns_transactions = ("اسم الصنف", "الكمية المستخدمة", "اسم المستلم", "التاريخ")
+tree_transactions = ttk.Treeview(transactions_frame, columns=columns_transactions, show="headings")
+for col in columns_transactions:
+    tree_transactions.heading(col, text=col)
+    tree_transactions.column(col, width=369, anchor="center", stretch=True)
+tree_transactions.tag_configure("evenrow", background="#E0E0E0")
+tree_transactions.tag_configure("oddrow", background="#FFFFFF")
+tree_transactions.pack(fill="both", expand=True)
+
+transactions_canvas.configure(yscrollcommand=transactions_scrollbar_y.set, xscrollcommand=transactions_scrollbar_x.set)
+
+def configure_transactions_canvas(event):
+    transactions_canvas.configure(scrollregion=transactions_canvas.bbox("all"))
+
+transactions_frame.bind("<Configure>", configure_transactions_canvas)
+
+# إطار إدخال صنف جديد
+frame_add_item = tk.LabelFrame(scrollable_frame, text="➕ إضافة صنف جديد", bg="#F5F5F5", fg="#000000", font=("Arial", 24, "bold"), relief="flat", bd=2, highlightthickness=1, highlightbackground="#D4A017")
+frame_add_item.pack(fill="both", expand=True, padx=10, pady=3)
+
+tk.Label(frame_add_item, text="اسم الصنف", bg="#F5F5F5", font=("Arial", 22), fg="#000000").grid(row=0, column=0, padx=15, pady=10, sticky="w")
+entry_item_name = tk.Entry(frame_add_item, font=("Arial", 22), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+entry_item_name.grid(row=0, column=1, padx=15, pady=10, sticky="ew")
+
+tk.Label(frame_add_item, text="عدد الصنف", bg="#F5F5F5", font=("Arial", 22), fg="#000000").grid(row=0, column=2, padx=15, pady=10, sticky="w")
+entry_quantity = tk.Entry(frame_add_item, font=("Arial", 22), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+entry_quantity.grid(row=0, column=3, padx=15, pady=10, sticky="ew")
+
+add_item_button = ttk.Button(frame_add_item, text="إضافة ➕", style="TButton", command=lambda: add_item(
+    entry_item_name.get(), entry_quantity.get()
+))
+add_item_button.grid(row=0, column=4, padx=15, pady=10)
+
+frame_add_item.grid_columnconfigure(1, weight=1)
+frame_add_item.grid_columnconfigure(3, weight=1)
+
+# إطار إدخال عملية استخدام
+frame_add_transaction = tk.LabelFrame(scrollable_frame, text="📋 إضافة عملية استخدام", bg="#F5F5F5", fg="#000000", font=("Arial", 24, "bold"), relief="flat", bd=2, highlightthickness=1, highlightbackground="#D4A017")
+frame_add_transaction.pack(fill="both", expand=True, padx=10, pady=3)
+
+tk.Label(frame_add_transaction, text="اسم الصنف", bg="#F5F5F5", font=("Arial", 22), fg="#000000").grid(row=0, column=0, padx=15, pady=10, sticky="w")
+trans_item_dropdown = ttk.Combobox(frame_add_transaction, font=("Arial", 22))
+trans_item_dropdown.grid(row=0, column=1, padx=15, pady=10, sticky="ew")
+
+tk.Label(frame_add_transaction, text="الكمية المستخدمة", bg="#F5F5F5", font=("Arial", 22), fg="#000000").grid(row=0, column=2, padx=15, pady=10, sticky="w")
+entry_used = tk.Entry(frame_add_transaction, font=("Arial", 22), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+entry_used.grid(row=0, column=3, padx=15, pady=10, sticky="ew")
+
+tk.Label(frame_add_transaction, text="اسم المستلم", bg="#F5F5F5", font=("Arial", 22), fg="#000000").grid(row=0, column=4, padx=15, pady=10, sticky="w")
+entry_receiver = tk.Entry(frame_add_transaction, font=("Arial", 22), bg="#FFFFFF", fg="#000000", relief="flat", bd=1, highlightthickness=1, highlightbackground="#D4A017")
+entry_receiver.grid(row=0, column=5, padx=15, pady=10, sticky="ew")
+
+add_transaction_button = ttk.Button(frame_add_transaction, text="إضافة 📋", style="TButton", command=lambda: add_transaction(
+    trans_item_dropdown.get(), entry_used.get(), entry_receiver.get()
+))
+add_transaction_button.grid(row=0, column=6, padx=15, pady=10)
+
+frame_add_transaction.grid_columnconfigure(1, weight=1)
+frame_add_transaction.grid_columnconfigure(3, weight=1)
+frame_add_transaction.grid_columnconfigure(5, weight=1)
+
+# إطار الأزرار
+frame_buttons = tk.Frame(scrollable_frame, bg="#F5F5F5")
+frame_buttons.pack(fill="x", padx=10, pady=5)
+
+export_button = ttk.Button(frame_buttons, text="📤 تصدير إلى Excel", style="TButton", command=export_to_excel)
+export_button.pack(side="left", padx=15)
+
+clear_button = ttk.Button(frame_buttons, text="🗑️ مسح جميع البيانات", style="Danger.TButton", command=clear_all_data)
+clear_button.pack(side="left", padx=15)
+
+refresh_button = ttk.Button(frame_buttons, text="🔄 تحديث", style="TButton", command=refresh_all)
+refresh_button.pack(side="left", padx=15)
+
+
+check_and_fix_database()
+setup_database()
+
+refresh_inventory()
+refresh_transactions()
+update_item_dropdown()
+update_statistics()
+
+
+root.mainloop()
